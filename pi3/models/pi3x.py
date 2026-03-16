@@ -213,6 +213,7 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
         mask_add_depth=None,
         mask_add_ray=None,
         mask_add_pose=None,
+        pose_only=False,
     ):
         """
         Forward pass with optional multimodal conditions.
@@ -242,7 +243,8 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
                 coordinate system (absolute pose for a single frame provides no relative constraint).
 
         Returns:
-            dict: Model outputs containing 'points', 'conf', etc.
+            dict: Model outputs containing 'camera_poses' and, when
+                `pose_only=False`, dense reconstruction outputs.
         """
         imgs = (imgs - self.image_mean) / self.image_std
 
@@ -267,7 +269,7 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
         hidden, pos = self.decode(hidden, N, H, W, poses_, use_pose_mask)
 
         # # head
-        outputs = self.forward_head(hidden, pos, B, N, H, W, patch_h, patch_w)
+        outputs = self.forward_head(hidden, pos, B, N, H, W, patch_h, patch_w, pose_only=pose_only)
 
         return outputs
     
@@ -382,12 +384,8 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
         
         return hidden, None, None, None, None
     
-    def forward_head(self, hidden, pos, B, N, H, W, patch_h, patch_w):
-        device = hidden.device
+    def forward_head(self, hidden, pos, B, N, H, W, patch_h, patch_w, pose_only=False):
         hw = patch_h*patch_w+self.patch_start_idx
-
-        # decode point
-        ret_point = self.point_decoder(hidden, xpos=pos)
 
         # decode camera
         ret_camera = self.camera_decoder(hidden, xpos=pos)
@@ -396,7 +394,18 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
         pos_hw = pos.reshape(B, N*hw, -1)
         ret_metric = self.metric_decoder(self.metric_token.repeat(B, 1, 1), hidden.reshape(B, N*hw, -1), xpos=pos_hw[:, 0:1], ypos=pos_hw)
 
-        # decode conf
+        with torch.amp.autocast(device_type='cuda', enabled=False):
+            camera_poses = self.camera_head(ret_camera[:, self.patch_start_idx:].float(), patch_h, patch_w).reshape(B, N, 4, 4)
+            metric = self.metric_head(ret_metric.float()).reshape(B).exp()
+            camera_poses[..., :3, 3] = camera_poses[..., :3, 3] * metric.view(B, 1, 1)
+            if pose_only:
+                return dict(
+                    camera_poses=camera_poses,
+                    metric=metric,
+                )
+
+        # decode point/conf only when dense outputs are requested
+        ret_point = self.point_decoder(hidden, xpos=pos)
         ret_conf = self.conf_decoder(hidden, xpos=pos)
 
         with torch.amp.autocast(device_type='cuda', enabled=False):
@@ -407,22 +416,9 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
             z = torch.exp(z.clamp(max=15.0))
             local_points = torch.cat([xy * z, z], dim=-1)
             rays = F.normalize(torch.cat([xy, torch.ones_like(z)], dim=-1), dim=-1)
-
-            camera_poses = self.camera_head(ret_camera[:, self.patch_start_idx:].float(), patch_h, patch_w).reshape(B, N, 4, 4)
-
-            metric = self.metric_head(ret_metric.float()).reshape(B).exp()
-
-            # conf
             conf = self.conf_head(ret_conf[:, self.patch_start_idx:].float(), patch_h=patch_h, patch_w=patch_w)[0]
             conf = conf.permute(0, 2, 3, 1).reshape(B, N, H, W, -1)
-
-            # points
             points = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses, homogenize_points(local_points))[..., :3] * metric.view(B, 1, 1, 1, 1)
-
-            # convert camera poses to metric
-            camera_poses[..., :3, 3] = camera_poses[..., :3, 3] * metric.view(B, 1, 1)
-
-            # convert local_points to metric
             local_points = local_points * metric.view(B, 1, 1, 1, 1)
 
         return dict(
@@ -460,7 +456,8 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
             pos = torch.cat([pos_special, pos_patch], dim=1)
 
         if self.use_multimodal:
-            if use_pose_mask.sum() == B * N:
+            num_pose_frames = int(use_pose_mask.sum().item())
+            if num_pose_frames == 0 or num_pose_frames == B * N:
                 pose_inject_mask = None
             else:
                 view_interaction_mask = use_pose_mask.unsqueeze(2) & use_pose_mask.unsqueeze(1)
@@ -490,7 +487,7 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
                     pose_inject_blk_idx += 1
 
             if i == len(self.decoder) - 2:
-                temp_features = hidden.clone().reshape(B*N, hw, -1)
+                temp_features = hidden.reshape(B*N, hw, -1)
 
         concatenated = torch.cat((temp_features, hidden.reshape(B*N, hw, -1)), dim=-1)
 
