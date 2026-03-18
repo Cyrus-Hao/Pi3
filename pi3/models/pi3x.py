@@ -25,6 +25,9 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
         super().__init__()
 
         self.use_multimodal = use_multimodal
+        # Keep the original training-time augmentation behavior by default.
+        # Specific inference entry points can disable prior scale augmentation.
+        self.disable_prior_scale_aug_for_inference = False
 
         # ----------------------
         #        Encoder
@@ -332,9 +335,16 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
                 bad_indices = (num_valid_pose == 1)
                 mask_add_pose[bad_indices] = False
 
+                disable_prior_scale_aug = (
+                    not self.training and self.disable_prior_scale_aug_for_inference
+                )
+
                 # normalize depth and pose
                 normalized_depths, dep_median = self.normalize_depth(depths, method='mean')
-                scale_aug = 0.8 + torch.rand((B,), device=device) * 0.4
+                if disable_prior_scale_aug:
+                    scale_aug = torch.ones((B,), device=device)
+                else:
+                    scale_aug = 0.8 + torch.rand((B,), device=device) * 0.4
                 normalized_depths /= scale_aug.view(B, 1, 1, 1)
                 dep_median *= scale_aug
 
@@ -353,7 +363,10 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
                     is_static_mask = pose_scale.max(dim=1)[0] < static_threshold
 
                     pose_scale = pose_scale.mean(dim=1)
-                    scale_aug = 0.8 + torch.rand((B,), device=device) * 0.4
+                    if disable_prior_scale_aug:
+                        scale_aug = torch.ones((B,), device=device)
+                    else:
+                        scale_aug = 0.8 + torch.rand((B,), device=device) * 0.4
                     pose_scale *= scale_aug
 
                     final_moving_mask = torch.logical_and(~use_depth_batch_mask, ~is_static_mask)

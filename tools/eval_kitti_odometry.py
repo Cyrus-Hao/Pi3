@@ -80,8 +80,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num_samples",
         type=int,
+        nargs="+",
         required=True,
-        help="Use only the first N frames from each sequence.",
+        help="Use only the first N frames from each sequence. Accepts one or more values.",
     )
     parser.add_argument(
         "--use_gt_pose_prior",
@@ -93,8 +94,9 @@ def parse_args() -> argparse.Namespace:
     invalid_sequences = [seq for seq in args.sequences if seq not in VALID_SEQUENCES]
     if invalid_sequences:
         parser.error(f"Invalid sequence IDs: {invalid_sequences}. Only 00-10 are supported.")
-    if args.num_samples <= 0:
-        parser.error("--num_samples must be a positive integer.")
+    invalid_num_samples = [num_samples for num_samples in args.num_samples if num_samples <= 0]
+    if invalid_num_samples:
+        parser.error(f"--num_samples must contain only positive integers, got: {invalid_num_samples}")
 
     return args
 
@@ -300,6 +302,12 @@ def load_model(device: torch.device) -> Pi3X:
     else:
         model = Pi3X.from_pretrained("yyfz233/Pi3X").eval()
     return model.to(device)
+
+
+def configure_model_for_kitti_odometry(model: Pi3X) -> Pi3X:
+    # Keep Pi3X's original prior scale augmentation behavior at inference time.
+    model.disable_prior_scale_aug_for_inference = False
+    return model
 
 
 def get_autocast_dtype(device: torch.device) -> torch.dtype | None:
@@ -562,161 +570,169 @@ def save_bird_eye_plot(
 def main() -> None:
     args = parse_args()
     kitti_root = resolve_kitti_root(args.kitti_root)
-    run_stem = build_run_stem(args.num_samples, args.use_gt_pose_prior)
-    output_root = Path("results") / run_stem
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     autocast_dtype = get_autocast_dtype(device)
 
     print(f"Using KITTI root: {kitti_root}")
     print(f"Using device: {device}")
     print("Loading Pi3X model...")
-    model = load_model(device)
-    output_root.mkdir(parents=True, exist_ok=True)
-    write_json(
-        output_root / "run_config.json",
-        {
-            "run_name": run_stem,
-            "kitti_root": str(kitti_root),
-            "sequences": args.sequences,
-            "num_samples_requested": int(args.num_samples),
-            "frame_selection": "first_n_contiguous",
-            "use_gt_pose_prior": bool(args.use_gt_pose_prior),
-            "pose_only": True,
-            "pixel_limit": int(PIXEL_LIMIT),
-            "device": str(device),
-            "autocast_dtype": str(autocast_dtype) if autocast_dtype is not None else None,
-            "command": " ".join(sys.argv),
-        },
-    )
-    sequence_summaries: list[dict[str, object]] = []
+    model = configure_model_for_kitti_odometry(load_model(device))
+    total_runs = len(args.num_samples)
 
-    for sequence in args.sequences:
-        print(f"Evaluating sequence {sequence}...")
-        image_dir, pose_file, calib_file, camera_key = find_sequence_assets(kitti_root, sequence)
-        frame_paths_all = list_frame_paths(image_dir)
-        gt_poses_all = load_pose_file(pose_file)
-        intrinsic_np = load_calibration_matrix(calib_file, camera_key)
-
-        num_frames = min(args.num_samples, len(frame_paths_all), gt_poses_all.shape[0])
-        if num_frames <= 0:
-            raise RuntimeError(f"Sequence {sequence} has no usable frames.")
-
-        frame_paths = frame_paths_all[:num_frames]
-        gt_poses_np = gt_poses_all[:num_frames]
-        imgs, gt_poses_t, intrinsics_t, tensor_metadata = load_sequence_tensors(frame_paths, gt_poses_np, intrinsic_np, device)
-        sequence_dir = output_root / f"sequence_{sequence}"
-        visualization_dir = sequence_dir / "visualizations"
-        visualization_dir.mkdir(parents=True, exist_ok=True)
-
-        outputs = infer_sequence(
-            model=model,
-            imgs=imgs,
-            poses=gt_poses_t,
-            intrinsics=intrinsics_t,
-            use_gt_pose_prior=args.use_gt_pose_prior,
-        )
-
-        pred_poses_np = outputs["camera_poses"][0].detach().float().cpu().numpy().astype(np.float64)
-        pred_poses_aligned, mapped_pred_origin = align_predicted_poses_to_gt(pred_poses_np, gt_poses_np)
-        origin_metrics = compute_pose_metrics(pred_poses_aligned, gt_poses_np)
-        save_bird_eye_plot(
-            sequence=sequence,
-            gt_poses=gt_poses_np,
-            pred_poses_aligned=pred_poses_aligned,
-            mapped_pred_origin=mapped_pred_origin,
-            output_dir=visualization_dir,
-            file_stem=build_visualization_stem(
-                sequence=sequence,
-                num_frames=num_frames,
-                use_gt_pose_prior=args.use_gt_pose_prior,
-                alignment_name="origin",
-            ),
-            title_suffix="Start-Aligned",
-            pred_label="Pi3 Predicted (Start-Aligned)",
-        )
-
-        pred_poses_umeyama, mapped_pred_origin_umeyama = align_predicted_poses_umeyama(pred_poses_np, gt_poses_np)
-        umeyama_metrics = compute_pose_metrics(pred_poses_umeyama, gt_poses_np)
-        save_bird_eye_plot(
-            sequence=sequence,
-            gt_poses=gt_poses_np,
-            pred_poses_aligned=pred_poses_umeyama,
-            mapped_pred_origin=mapped_pred_origin_umeyama,
-            output_dir=visualization_dir,
-            file_stem=build_visualization_stem(
-                sequence=sequence,
-                num_frames=num_frames,
-                use_gt_pose_prior=args.use_gt_pose_prior,
-                alignment_name="umeyama",
-            ),
-            title_suffix="Umeyama-Aligned",
-            pred_label="Pi3 Predicted (Umeyama)",
-        )
-
-        np.save(sequence_dir / "pred_poses_raw.npy", pred_poses_np)
-        np.save(sequence_dir / "pred_poses_origin.npy", pred_poses_aligned)
-        np.save(sequence_dir / "pred_poses_umeyama.npy", pred_poses_umeyama)
-        np.save(sequence_dir / "gt_poses.npy", gt_poses_np)
-
+    for run_idx, num_samples in enumerate(args.num_samples, start=1):
+        run_stem = build_run_stem(num_samples, args.use_gt_pose_prior)
+        output_root = Path("results") / run_stem
+        print(f"Starting run {run_idx}/{total_runs}: num_samples={num_samples}")
+        output_root.mkdir(parents=True, exist_ok=True)
         write_json(
-            sequence_dir / "sequence_config.json",
+            output_root / "run_config.json",
             {
-                "sequence": sequence,
-                "num_frames_used": int(num_frames),
-                "num_frames_available": int(len(frame_paths_all)),
-                "num_gt_poses_available": int(gt_poses_all.shape[0]),
+                "run_name": run_stem,
+                "kitti_root": str(kitti_root),
+                "sequences": args.sequences,
+                "num_samples_requested": int(num_samples),
+                "num_samples_requested_all": [int(value) for value in args.num_samples],
                 "frame_selection": "first_n_contiguous",
                 "use_gt_pose_prior": bool(args.use_gt_pose_prior),
-                "camera_key": camera_key,
-                "image_dir": str(image_dir),
-                "pose_file": str(pose_file),
-                "calib_file": str(calib_file),
-                "input_image_size": {
-                    "width": tensor_metadata["width_orig"],
-                    "height": tensor_metadata["height_orig"],
-                },
-                "model_image_size": {
-                    "width": tensor_metadata["target_width"],
-                    "height": tensor_metadata["target_height"],
-                },
-                "autocast_dtype": str(autocast_dtype) if autocast_dtype is not None else None,
                 "pose_only": True,
-                "visualizations": [
-                    f"visualizations/{build_visualization_stem(sequence, num_frames, args.use_gt_pose_prior, 'origin')}.png",
-                    f"visualizations/{build_visualization_stem(sequence, num_frames, args.use_gt_pose_prior, 'umeyama')}.png",
-                ],
-                "frame_names": [path.name for path in frame_paths],
+                "disable_prior_scale_aug_for_inference": bool(model.disable_prior_scale_aug_for_inference),
+                "pixel_limit": int(PIXEL_LIMIT),
+                "device": str(device),
+                "autocast_dtype": str(autocast_dtype) if autocast_dtype is not None else None,
+                "command": " ".join(sys.argv),
             },
         )
-        write_json(sequence_dir / "metrics_origin.json", origin_metrics)
-        write_json(sequence_dir / "metrics_umeyama.json", umeyama_metrics)
+        sequence_summaries: list[dict[str, object]] = []
 
-        sequence_summaries.append(
-            {
-                "sequence": sequence,
-                "num_frames_used": int(num_frames),
-                "origin": {
-                    "ape_translation_rmse_m": origin_metrics["ape_translation_m"]["rmse"],
-                    "ape_rotation_rmse_deg": origin_metrics["ape_rotation_deg"]["rmse"],
-                    "rpe_translation_rmse_m": origin_metrics["rpe_translation_m"]["rmse"],
-                    "rpe_rotation_rmse_deg": origin_metrics["rpe_rotation_deg"]["rmse"],
+        for sequence in args.sequences:
+            print(f"Evaluating sequence {sequence}...")
+            image_dir, pose_file, calib_file, camera_key = find_sequence_assets(kitti_root, sequence)
+            frame_paths_all = list_frame_paths(image_dir)
+            gt_poses_all = load_pose_file(pose_file)
+            intrinsic_np = load_calibration_matrix(calib_file, camera_key)
+
+            num_frames = min(num_samples, len(frame_paths_all), gt_poses_all.shape[0])
+            if num_frames <= 0:
+                raise RuntimeError(f"Sequence {sequence} has no usable frames.")
+
+            frame_paths = frame_paths_all[:num_frames]
+            gt_poses_np = gt_poses_all[:num_frames]
+            imgs, gt_poses_t, intrinsics_t, tensor_metadata = load_sequence_tensors(frame_paths, gt_poses_np, intrinsic_np, device)
+            sequence_dir = output_root / f"sequence_{sequence}"
+            visualization_dir = sequence_dir / "visualizations"
+            visualization_dir.mkdir(parents=True, exist_ok=True)
+
+            outputs = infer_sequence(
+                model=model,
+                imgs=imgs,
+                poses=gt_poses_t,
+                intrinsics=intrinsics_t,
+                use_gt_pose_prior=args.use_gt_pose_prior,
+            )
+
+            pred_poses_np = outputs["camera_poses"][0].detach().float().cpu().numpy().astype(np.float64)
+            pred_poses_aligned, mapped_pred_origin = align_predicted_poses_to_gt(pred_poses_np, gt_poses_np)
+            origin_metrics = compute_pose_metrics(pred_poses_aligned, gt_poses_np)
+            save_bird_eye_plot(
+                sequence=sequence,
+                gt_poses=gt_poses_np,
+                pred_poses_aligned=pred_poses_aligned,
+                mapped_pred_origin=mapped_pred_origin,
+                output_dir=visualization_dir,
+                file_stem=build_visualization_stem(
+                    sequence=sequence,
+                    num_frames=num_frames,
+                    use_gt_pose_prior=args.use_gt_pose_prior,
+                    alignment_name="origin",
+                ),
+                title_suffix="Start-Aligned",
+                pred_label="Pi3 Predicted (Start-Aligned)",
+            )
+
+            pred_poses_umeyama, mapped_pred_origin_umeyama = align_predicted_poses_umeyama(pred_poses_np, gt_poses_np)
+            umeyama_metrics = compute_pose_metrics(pred_poses_umeyama, gt_poses_np)
+            save_bird_eye_plot(
+                sequence=sequence,
+                gt_poses=gt_poses_np,
+                pred_poses_aligned=pred_poses_umeyama,
+                mapped_pred_origin=mapped_pred_origin_umeyama,
+                output_dir=visualization_dir,
+                file_stem=build_visualization_stem(
+                    sequence=sequence,
+                    num_frames=num_frames,
+                    use_gt_pose_prior=args.use_gt_pose_prior,
+                    alignment_name="umeyama",
+                ),
+                title_suffix="Umeyama-Aligned",
+                pred_label="Pi3 Predicted (Umeyama)",
+            )
+
+            np.save(sequence_dir / "pred_poses_raw.npy", pred_poses_np)
+            np.save(sequence_dir / "pred_poses_origin.npy", pred_poses_aligned)
+            np.save(sequence_dir / "pred_poses_umeyama.npy", pred_poses_umeyama)
+            np.save(sequence_dir / "gt_poses.npy", gt_poses_np)
+
+            write_json(
+                sequence_dir / "sequence_config.json",
+                {
+                    "sequence": sequence,
+                    "num_frames_used": int(num_frames),
+                    "num_frames_available": int(len(frame_paths_all)),
+                    "num_gt_poses_available": int(gt_poses_all.shape[0]),
+                    "frame_selection": "first_n_contiguous",
+                    "use_gt_pose_prior": bool(args.use_gt_pose_prior),
+                    "camera_key": camera_key,
+                    "image_dir": str(image_dir),
+                    "pose_file": str(pose_file),
+                    "calib_file": str(calib_file),
+                    "input_image_size": {
+                        "width": tensor_metadata["width_orig"],
+                        "height": tensor_metadata["height_orig"],
+                    },
+                    "model_image_size": {
+                        "width": tensor_metadata["target_width"],
+                        "height": tensor_metadata["target_height"],
+                    },
+                    "autocast_dtype": str(autocast_dtype) if autocast_dtype is not None else None,
+                    "pose_only": True,
+                    "disable_prior_scale_aug_for_inference": bool(model.disable_prior_scale_aug_for_inference),
+                    "visualizations": [
+                        f"visualizations/{build_visualization_stem(sequence, num_frames, args.use_gt_pose_prior, 'origin')}.png",
+                        f"visualizations/{build_visualization_stem(sequence, num_frames, args.use_gt_pose_prior, 'umeyama')}.png",
+                    ],
+                    "frame_names": [path.name for path in frame_paths],
                 },
-                "umeyama": {
-                    "ape_translation_rmse_m": umeyama_metrics["ape_translation_m"]["rmse"],
-                    "ape_rotation_rmse_deg": umeyama_metrics["ape_rotation_deg"]["rmse"],
-                    "rpe_translation_rmse_m": umeyama_metrics["rpe_translation_m"]["rmse"],
-                    "rpe_rotation_rmse_deg": umeyama_metrics["rpe_rotation_deg"]["rmse"],
-                },
-            }
-        )
+            )
+            write_json(sequence_dir / "metrics_origin.json", origin_metrics)
+            write_json(sequence_dir / "metrics_umeyama.json", umeyama_metrics)
 
-        print(f"Sequence {sequence} done, {num_frames} frames processed")
+            sequence_summaries.append(
+                {
+                    "sequence": sequence,
+                    "num_frames_used": int(num_frames),
+                    "origin": {
+                        "ape_translation_rmse_m": origin_metrics["ape_translation_m"]["rmse"],
+                        "ape_rotation_rmse_deg": origin_metrics["ape_rotation_deg"]["rmse"],
+                        "rpe_translation_rmse_m": origin_metrics["rpe_translation_m"]["rmse"],
+                        "rpe_rotation_rmse_deg": origin_metrics["rpe_rotation_deg"]["rmse"],
+                    },
+                    "umeyama": {
+                        "ape_translation_rmse_m": umeyama_metrics["ape_translation_m"]["rmse"],
+                        "ape_rotation_rmse_deg": umeyama_metrics["ape_rotation_deg"]["rmse"],
+                        "rpe_translation_rmse_m": umeyama_metrics["rpe_translation_m"]["rmse"],
+                        "rpe_rotation_rmse_deg": umeyama_metrics["rpe_rotation_deg"]["rmse"],
+                    },
+                }
+            )
 
-        del imgs, gt_poses_t, intrinsics_t, outputs
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+            print(f"Sequence {sequence} done, {num_frames} frames processed")
 
-    write_json(output_root / "summary.json", {"run_name": run_stem, "sequences": sequence_summaries})
+            del imgs, gt_poses_t, intrinsics_t, outputs
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        write_json(output_root / "summary.json", {"run_name": run_stem, "sequences": sequence_summaries})
+        print(f"Completed run {run_idx}/{total_runs}: num_samples={num_samples}")
 
 
 if __name__ == "__main__":
