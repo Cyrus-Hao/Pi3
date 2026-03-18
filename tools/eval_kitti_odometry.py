@@ -46,7 +46,7 @@ except ModuleNotFoundError:
         def from_pretrained(cls, *args, **kwargs):
             raise ModuleNotFoundError(
                 "`huggingface_hub` is required for from_pretrained(). "
-                "Install it or place a local Pi3X checkpoint at cpkt/pi3x.safetensors."
+                "Install it or place a local Pi3X checkpoint at ckpt/pi3x.safetensors."
             )
 
     hub_module.PyTorchModelHubMixin = PyTorchModelHubMixin
@@ -58,7 +58,7 @@ from pi3.models.pi3x import Pi3X
 VALID_SEQUENCES = {f"{idx:02d}" for idx in range(11)}
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg")
 PIXEL_LIMIT = 255000
-LOCAL_PI3X_CKPT = REPO_ROOT / "cpkt" / "pi3x.safetensors"
+LOCAL_PI3X_CKPT = REPO_ROOT / "ckpt" / "pi3x.safetensors"
 RESAMPLE_LANCZOS = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
 
 
